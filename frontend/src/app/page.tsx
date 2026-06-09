@@ -266,8 +266,10 @@ export default function Home() {
 
   // Double-click detection
   const lastClickTimeRef = useRef<number>(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   /* ── State (for React rendering only) ── */
+  const [inputSource, setInputSource] = useState<"camera" | "video">("camera");
   const [isStreaming, setIsStreaming] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [serverFps, setServerFps] = useState(0);
@@ -655,9 +657,17 @@ export default function Home() {
     if (sendIntervalRef.current) { clearInterval(sendIntervalRef.current); sendIntervalRef.current = null; }
     cancelAnimationFrame(animFrameRef.current);
     const video = videoRef.current;
-    if (video?.srcObject) {
-      (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
-      video.srcObject = null;
+    if (video) {
+      if (video.srcObject) {
+        (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
+        video.srcObject = null;
+      }
+      if (video.src) {
+        URL.revokeObjectURL(video.src);
+        video.removeAttribute("src");
+        video.load();
+      }
+      video.loop = false;
     }
     wsRef.current?.close();
     wsRef.current = null;
@@ -670,11 +680,85 @@ export default function Home() {
     pendingDrawRef.current = null;
     frameIdRef.current = 0;
 
+    // Reset boundary line and states
+    drawnPointsRef.current = [];
+    polylineRef.current = null;
+    drawStepRef.current = "idle";
+    mousePosRef.current = null;
+    setDrawStep("idle");
+    setPointCount(0);
+    setSideLabel(null);
+
+    // Clear output canvas pixels
+    const canvas = outputCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
     setIsStreaming(false);
     setWsConnected(false);
     setDetectionCount(0);
     setServerFps(0);
   }, []);
+
+  /* ── Start video file streaming ── */
+  const startVideoFileStreaming = useCallback(async (file: File) => {
+    try {
+      stopStreaming();
+
+      const video = videoRef.current!;
+      video.srcObject = null;
+      video.loop = true;
+      video.muted = true; // Ensure autoplay is allowed by browser policies
+      
+      const fileUrl = URL.createObjectURL(file);
+      video.src = fileUrl;
+
+      await new Promise<void>((resolve) => {
+        video.onloadedmetadata = () => {
+          resolve();
+        };
+      });
+
+      await video.play();
+
+      const camW = video.videoWidth || 640;
+      const camH = video.videoHeight || 480;
+      cameraResRef.current = { w: camW, h: camH };
+      setCameraRes(`${camW}×${camH} (File)`);
+
+      outputCanvasRef.current!.width = camW;
+      outputCanvasRef.current!.height = camH;
+      sendCanvasRef.current!.width = TARGET_W;
+      sendCanvasRef.current!.height = TARGET_H;
+      letterboxRef.current = computeLetterbox(camW, camH);
+
+      connectWs();
+      sendIntervalRef.current = setInterval(sendFrame, 1000 / SEND_FPS);
+      animFrameRef.current = requestAnimationFrame(drawOutput);
+      setIsStreaming(true);
+    } catch (err) {
+      console.error("Video file error:", err);
+      alert("Could not load or play video file.");
+    }
+  }, [connectWs, sendFrame, drawOutput, stopStreaming]);
+
+  /* ── Handle Source Switch ── */
+  const handleSourceChange = useCallback((source: "camera" | "video") => {
+    stopStreaming();
+    setInputSource(source);
+  }, [stopStreaming]);
+
+  /* ── Handle File Select ── */
+  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      startVideoFileStreaming(file);
+    }
+    // Reset value so selecting the same file again triggers onChange
+    e.target.value = "";
+  }, [startVideoFileStreaming]);
 
   /* ── Cleanup on unmount ── */
   useEffect(() => () => stopStreaming(), [stopStreaming]);
@@ -768,9 +852,14 @@ export default function Home() {
             })
           );
         }
+
+        // Resume video file playback once boundary configuration is complete
+        if (inputSource === "video") {
+          videoRef.current?.play().catch(() => {});
+        }
       }
     },
-    [finishDrawing]
+    [finishDrawing, inputSource]
   );
 
   /* ── Reset line ── */
@@ -786,7 +875,12 @@ export default function Home() {
 
     wsRef.current?.readyState === WebSocket.OPEN &&
       wsRef.current.send(JSON.stringify({ type: "clear_line" }));
-  }, []);
+
+    // Resume video file playback if it was paused during drawing
+    if (inputSource === "video") {
+      videoRef.current?.play().catch(() => {});
+    }
+  }, [inputSource]);
 
   /* ── Start drawing mode ── */
   const startDrawing = useCallback(() => {
@@ -797,7 +891,12 @@ export default function Home() {
     setDrawStep("drawing");
     setPointCount(0);
     setSideLabel(null);
-  }, []);
+
+    // Pause video playback so the user can easily draw on a static frame
+    if (inputSource === "video") {
+      videoRef.current?.pause();
+    }
+  }, [inputSource]);
 
   /* ══════════════════════════════════ */
   /*              Render                */
@@ -846,13 +945,19 @@ export default function Home() {
             />
             {!isStreaming && (
               <div className="placeholder-message">
-                <div className="placeholder-icon">📹</div>
-                <p>Start camera to begin detection</p>
+                <div className="placeholder-icon">{inputSource === "camera" ? "📹" : "📁"}</div>
+                <p>
+                  {inputSource === "camera"
+                    ? "Start camera to begin detection"
+                    : "Select a video file to begin detection"}
+                </p>
               </div>
             )}
             {isStreaming && (
               <div className="canvas-overlay">
-                <span className="overlay-tag live">● LIVE</span>
+                <span className={`overlay-tag ${inputSource === "camera" ? "live" : ""}`}>
+                  ● {inputSource === "camera" ? "LIVE" : "FILE"}
+                </span>
                 {detectionCount > 0 && (
                   <span className="overlay-tag">
                     {detectionCount} person{detectionCount > 1 ? "s" : ""}
@@ -865,18 +970,53 @@ export default function Home() {
 
         {/* Side Panel */}
         <div className="side-panel">
-          {/* Camera Controls */}
+          {/* Input Source Controls */}
           <div className="panel-section">
-            <h3>Camera</h3>
-            <div className="btn-group">
-              {!isStreaming ? (
-                <button className="btn btn-primary" onClick={startStreaming} id="btn-start-camera">
-                  ▶ Start Camera
-                </button>
+            <h3>Input Source</h3>
+            <div className="source-selector">
+              <button
+                className={`source-tab ${inputSource === "camera" ? "active" : ""}`}
+                onClick={() => handleSourceChange("camera")}
+              >
+                📹 Webcam
+              </button>
+              <button
+                className={`source-tab ${inputSource === "video" ? "active" : ""}`}
+                onClick={() => handleSourceChange("video")}
+              >
+                📁 Video File
+              </button>
+            </div>
+            <div className="btn-group" style={{ marginTop: "12px" }}>
+              {inputSource === "camera" ? (
+                !isStreaming ? (
+                  <button className="btn btn-primary" onClick={startStreaming} id="btn-start-camera">
+                    ▶ Start Camera
+                  </button>
+                ) : (
+                  <button className="btn btn-danger" onClick={stopStreaming} id="btn-stop-camera">
+                    ■ Stop Camera
+                  </button>
+                )
               ) : (
-                <button className="btn btn-danger" onClick={stopStreaming} id="btn-stop-camera">
-                  ■ Stop Camera
-                </button>
+                <>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    accept="video/*"
+                    style={{ display: "none" }}
+                    onChange={handleFileChange}
+                  />
+                  {!isStreaming ? (
+                    <button className="btn btn-primary" onClick={() => fileInputRef.current?.click()} id="btn-upload-video">
+                      📁 Select Video File
+                    </button>
+                  ) : (
+                    <button className="btn btn-danger" onClick={stopStreaming} id="btn-stop-video">
+                      ■ Stop Video
+                    </button>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -952,7 +1092,11 @@ export default function Home() {
             <div className="instructions">
               <div className="instruction-step">
                 <span className={`step-num ${isStreaming ? "done" : ""}`}>1</span>
-                <span>Start camera to begin streaming</span>
+                <span>
+                  {inputSource === "camera"
+                    ? "Start camera to begin streaming"
+                    : "Select and load a video file"}
+                </span>
               </div>
               <div className="instruction-step">
                 <span className={`step-num ${drawStep !== "idle" ? "done" : ""}`}>2</span>
