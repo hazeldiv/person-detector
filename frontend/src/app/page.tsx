@@ -831,17 +831,20 @@ export default function Home() {
         const poly = polylineRef.current;
         if (!poly || poly.length < 2) return;
 
-        // Compute parity of the clicked point to determine which side the user chose
-        const parity = raycastParity(x, y, poly);
+        // Convert polyline + click point to 640×480 letterbox space
+        // so that parity matches exactly what the backend computes
+        const lb = letterboxRef.current;
+        if (!lb) return;
+        const lbPoints = poly.map((p) => toLetterboxPt(p.x, p.y, lb));
+        const lbClick  = toLetterboxPt(x, y, lb);
+
+        // Compute parity in letterbox space — must agree with backend's raycast_parity
+        const parity = raycastParity(lbClick.x, lbClick.y, lbPoints);
         const label: "A" | "B" = parity === 0 ? "A" : "B";
         setSideLabel(label);
         drawStepRef.current = "active";
         setDrawStep("active");
 
-        // Convert polyline to 640×480 letterbox space and send to server
-        const lb = letterboxRef.current;
-        if (!lb) return;
-        const lbPoints = poly.map((p) => toLetterboxPt(p.x, p.y, lb));
         const ws = wsRef.current;
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(
